@@ -171,6 +171,115 @@ def cross_attention_attnblock_forward(self, x):
 
         return h3
 
+
+def flash_attention_forward(self, x, context=None, mask=None):
+    """
+    :param x: are the input embeddings of shape `[batch_size, height * width, d_model]`
+    :param cond: is the conditional embeddings of shape `[batch_size, n_cond, d_cond]`
+    """
+
+    def flash_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """
+        #### Flash Attention
+        :param q: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param k: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param v: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        """
+
+        # Get batch size and number of elements along sequence axis (`width * height`)
+        batch_size, seq_len, _ = q.shape
+
+        if q.shape != k.shape:
+            k = torch.nn.functional.pad(k, (0, 0, q.shape[1] - k.shape[1], 0, 0, 0), "constant", 0)
+            v = torch.nn.functional.pad(v, (0, 0, q.shape[1] - v.shape[1], 0, 0, 0), "constant", 0)
+
+        # Stack `q`, `k`, `v` vectors for flash attention, to get a single tensor of
+        qkv = torch.stack((q, k, v), dim=2)
+
+        # Split the heads
+        qkv = qkv.view(batch_size, seq_len, 3, self.heads, self.dim_head)
+
+        # Flash attention works for head sizes `32`, `64` and `128`, so we have to pad the heads to
+        # fit this size.
+        if self.dim_head <= 32:
+            pad = 32 - self.dim_head
+        elif self.dim_head <= 64:
+            pad = 64 - self.dim_head
+        elif self.dim_head <= 128:
+            pad = 128 - self.dim_head
+        else:
+            raise ValueError(f'Head size ${self.dim_head} too large for Flash Attention')
+
+        # Pad the heads
+        if pad:
+            qkv = torch.cat((qkv, qkv.new_zeros(batch_size, seq_len, 3, self.heads, pad)), dim=-1)
+
+        # Compute attention
+        # $$\underset{seq}{softmax}\Bigg(\frac{Q K^\top}{\sqrt{d_{key}}}\Bigg)V$$
+        # This gives a tensor of shape `[batch_size, seq_len, heads, d_padded]`
+        out, _ = self.flash(qkv)
+        # Truncate the extra head size
+        out = out[:, :, :, :self.dim_head]
+        # Reshape to `[batch_size, seq_len, heads * dim_head]`
+        out = out.reshape(batch_size, seq_len, self.heads * self.dim_head)
+
+        # Map to `[batch_size, height * width, d_model]` with a linear layer
+        return self.to_out(out)
+
+    def normal_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """
+        #### Normal Attention
+
+        :param q: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param k: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param v: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        """
+
+        # Split them to heads of shape `[batch_size, seq_len, heads, dim_head]`
+        q = q.view(*q.shape[:2], self.heads, -1)
+        k = k.view(*k.shape[:2], self.heads, -1)
+        v = v.view(*v.shape[:2], self.heads, -1)
+
+        # Calculate attention $\frac{Q K^\top}{\sqrt{d_{key}}}$
+        attn = torch.einsum('bihd,bjhd->bhij', q, k) * self.scale
+
+        # Compute softmax
+        # $$\underset{seq}{softmax}\Bigg(\frac{Q K^\top}{\sqrt{d_{key}}}\Bigg)$$
+
+        if False:  # self.is_inplace:
+            half = attn.shape[0] // 2
+            attn[half:] = attn[half:].softmax(dim=-1)
+            attn[:half] = attn[:half].softmax(dim=-1)
+        else:
+            attn = attn.softmax(dim=-1)
+
+        # Compute attention output
+        # $$\underset{seq}{softmax}\Bigg(\frac{Q K^\top}{\sqrt{d_{key}}}\Bigg)V$$
+        out = torch.einsum('bhij,bjhd->bihd', attn, v)
+        # Reshape to `[batch_size, height * width, heads * dim_head]`
+        out = out.reshape(*out.shape[:2], -1)
+        # Map to `[batch_size, height * width, d_model]` with a linear layer
+        return self.to_out(out)
+
+    self.flash.softmax_scale = self.scale
+
+    # reverse what was stored to self.scale in __init__, because dim_head itself isn't stored
+    self.dim_head = int(self.scale ** -2)
+
+    # Get query, key and value vectors
+    q = self.to_q(x)
+    context = default(context, x)
+    k = self.to_k(context)
+    v = self.to_v(context)
+
+    # Use flash attention if it's available and the head size is less than or equal to `128`
+    if self.dim_head <= 128:
+        return flash_attention(self, q, k, v)
+    # Otherwise, fallback to normal attention
+    else:
+        return normal_attention(self, q, k, v)
+
+
 class StableDiffusionModelHijack:
     ids_lookup = {}
     word_embeddings = {}
@@ -243,7 +352,11 @@ class StableDiffusionModelHijack:
         model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
         m.cond_stage_model = FrozenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
 
-        if cmd_opts.opt_split_attention_v1:
+        if cmd_opts.opt_flash_attention:
+            from flash_attn.flash_attention import FlashAttention
+            ldm.modules.attention.CrossAttention.flash = FlashAttention()
+            ldm.modules.attention.CrossAttention.forward = flash_attention_forward
+        elif cmd_opts.opt_split_attention_v1:
             ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward_v1
         elif not cmd_opts.disable_opt_split_attention and (cmd_opts.opt_split_attention or torch.cuda.is_available()):
             ldm.modules.attention.CrossAttention.forward = split_cross_attention_forward

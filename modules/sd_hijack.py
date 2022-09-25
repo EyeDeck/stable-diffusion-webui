@@ -189,10 +189,6 @@ def flash_attention_forward(self, x, context=None, mask=None):
         # Get batch size and number of elements along sequence axis (`width * height`)
         batch_size, seq_len, _ = q.shape
 
-        if q.shape != k.shape:
-            k = torch.nn.functional.pad(k, (0, 0, q.shape[1] - k.shape[1], 0, 0, 0), "constant", 0)
-            v = torch.nn.functional.pad(v, (0, 0, q.shape[1] - v.shape[1], 0, 0, 0), "constant", 0)
-
         # Stack `q`, `k`, `v` vectors for flash attention, to get a single tensor of
         qkv = torch.stack((q, k, v), dim=2)
 
@@ -273,7 +269,7 @@ def flash_attention_forward(self, x, context=None, mask=None):
     v = self.to_v(context)
 
     # Use flash attention if it's available and the head size is less than or equal to `128`
-    if self.dim_head <= 128:
+    if self.dim_head <= 128 and q.shape == k.shape:
         return flash_attention(self, q, k, v)
     # Otherwise, fallback to normal attention
     else:
